@@ -7,174 +7,248 @@ from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 
 # ==========================================
-# 配置区域 (请填入你的 FRED API Key)
+# 配置区域
 # ==========================================
-FRED_API_KEY = st.secrets["FRED_API_KEY"]
-fred = Fred(api_key=FRED_API_KEY)
+# 优先尝试从 Streamlit Secrets 读取 (云端模式)
+# 如果本地运行报错，请直接将下面的字符串替换为你的真实 Key，例如: FRED_API_KEY = 'abcdef12345...'
+try:
+    FRED_API_KEY = st.secrets["FRED_API_KEY"]
+except:
+    FRED_API_KEY = '在此处填入你的FRED_API_KEY' 
+
+# 初始化
+try:
+    fred = Fred(api_key=FRED_API_KEY)
+except:
+    st.error("请配置有效的 FRED API Key 才能获取宏观数据。")
+
+# 页面宽屏模式
+st.set_page_config(page_title="华尔街宏观仪表盘 (PC版)", layout="wide", initial_sidebar_state="expanded")
 
 # ==========================================
-# 1. 数据获取与清洗模块
+# 1. 数据获取模块 (增强版)
 # ==========================================
-
-@st.cache_data(ttl=3600) # 缓存数据1小时，避免频繁请求
-def get_market_data(period='2y'):
-    """获取标普500 (SPY) 和 纳指 (QQQ) 的数据"""
-    tickers = ['SPY', 'QQQ', '^TNX'] # ^TNX 是10年期美债收益率
-    data = yf.download(tickers, period=period, interval='1d')['Close']
-    data.columns = ['10Y_Yield', 'QQQ', 'SPY'] # 注意：yfinance列名排序可能不同，需根据实际调整
-    # 重新映射列名以防万一
-    data = yf.download(tickers, period=period, interval='1d')['Close']
-    return data
 
 @st.cache_data(ttl=3600)
-def get_fed_liquidity_data(start_date):
+def get_data_bundle(start_date_str):
     """
-    从FRED拉取流动性数据:
-    WALCL: 美联储总资产 (Fed Balance Sheet)
-    WTREGEN: 财政部TGA账户 (Treasury General Account)
-    RRPONTSYD: 逆回购 (Reverse Repo)
+    为了提高速度，一次性拉取并对齐所有数据
     """
+    # 1. 股市与收益率数据 (Yahoo Finance)
+    # yfinance 接收 YYYY-MM-DD 格式
+    tickers = ['SPY', 'QQQ', '^TNX'] 
+    stock_data = yf.download(tickers, start=start_date_str, interval='1d')['Close']
+    # 简单的列名清理
+    if isinstance(stock_data.columns, pd.MultiIndex):
+        stock_data.columns = stock_data.columns.get_level_values(0)
+    
+    # 重命名以防万一
+    mapper = {'^TNX': '10Y_Yield', 'QQQ': 'QQQ', 'SPY': 'SPY'}
+    stock_data = stock_data.rename(columns=mapper)
+    
+    # 2. 宏观流动性数据 (FRED)
     try:
-        walcl = fred.get_series('WALCL', observation_start=start_date)
-        tga = fred.get_series('WTREGEN', observation_start=start_date)
-        rrp = fred.get_series('RRPONTSYD', observation_start=start_date)
+        # WALCL: 美联储资产 (周更) | WTREGEN: TGA (日更) | RRPONTSYD: 逆回购 (日更)
+        walcl = fred.get_series('WALCL', observation_start=start_date_str)
+        tga = fred.get_series('WTREGEN', observation_start=start_date_str)
+        rrp = fred.get_series('RRPONTSYD', observation_start=start_date_str)
         
-        df = pd.DataFrame({'Total_Assets': walcl, 'TGA': tga, 'RRP': rrp})
-        df = df.fillna(method='ffill') # 填充周末空缺
+        # 利率数据
+        sofr = fred.get_series('SOFR', observation_start=start_date_str)
+        effr = fred.get_series('EFFR', observation_start=start_date_str)
         
-        # 计算净流动性 (单位：十亿美元)
-        # Net Liquidity = Fed Assets - TGA - RRP
-        df['Net_Liquidity'] = (df['Total_Assets'] - df['TGA'] - df['RRP']) / 1000 
-        return df
+        # 合并宏观数据
+        macro_df = pd.DataFrame({
+            'Total_Assets': walcl, 
+            'TGA': tga, 
+            'RRP': rrp,
+            'SOFR': sofr,
+            'EFFR': effr
+        })
+        
+        # 数据对齐与填充
+        # 宏观数据(特别是WALCL)频率低，需要前向填充
+        macro_df = macro_df.fillna(method='ffill')
+        
+        # 计算衍生指标
+        # 净流动性 (十亿美元)
+        macro_df['Net_Liquidity'] = (macro_df['Total_Assets'] - macro_df['TGA'] - macro_df['RRP']) / 1000
+        # 利率压力
+        macro_df['Rate_Spread'] = macro_df['SOFR'] - macro_df['EFFR']
+        
+        # 3. 最终合并
+        # 以股市交易日为基准 (inner join 可能导致周末数据丢失，这正是我们想要的，只看交易日)
+        df_final = stock_data.join(macro_df, how='inner').sort_index()
+        
+        # 二次填充，防止某些宏观数据在股市交易日缺失
+        df_final = df_final.fillna(method='ffill')
+        
+        return df_final
+        
     except Exception as e:
-        st.error(f"FRED 数据拉取失败，请检查API Key。错误信息: {e}")
-        return pd.DataFrame()
-
-@st.cache_data(ttl=3600)
-def get_rates_stress(start_date):
-    """获取 SOFR 和 EFFR 利率"""
-    try:
-        sofr = fred.get_series('SOFR', observation_start=start_date)
-        effr = fred.get_series('EFFR', observation_start=start_date)
-        df = pd.DataFrame({'SOFR': sofr, 'EFFR': effr})
-        df = df.fillna(method='ffill')
-        df['Spread'] = df['SOFR'] - df['EFFR']
-        return df
-    except Exception as e:
+        st.error(f"FRED 数据拉取失败: {e}")
         return pd.DataFrame()
 
 # ==========================================
-# 2. 页面布局与可视化模块
+# 2. 侧边栏控制
 # ==========================================
 
-st.set_page_config(page_title="华尔街宏观量化仪表盘", layout="wide")
+st.sidebar.header("🕹️ 控制台")
 
-st.title("🏦 华尔街流动性与风险监控系统")
-st.markdown("---")
+# 时间范围选择 (支持更短周期)
+time_options = {
+    '1个月': 30,
+    '3个月': 90,
+    '6个月': 180,
+    '今年以来 (YTD)': 'YTD',
+    '1年': 365,
+    '3年': 1095,
+    '5年': 1825
+}
+selected_range = st.sidebar.selectbox("📅 回溯时间", list(time_options.keys()), index=4)
 
-# 侧边栏控制
-st.sidebar.header("设置")
-time_range = st.sidebar.selectbox("选择时间范围", ['1年', '2年', '5年'], index=1)
-days_map = {'1年': 365, '2年': 730, '5年': 1825}
-start_date_str = (datetime.now() - timedelta(days=days_map[time_range])).strftime('%Y-%m-%d')
+# 计算开始日期
+if selected_range == '今年以来 (YTD)':
+    start_date = datetime(datetime.now().year, 1, 1)
+else:
+    days = time_options[selected_range]
+    start_date = datetime.now() - timedelta(days=days)
+
+start_date_str = start_date.strftime('%Y-%m-%d')
+
+st.sidebar.markdown("---")
+st.sidebar.info(f"当前数据起始: **{start_date_str}**")
+
+# ==========================================
+# 3. 页面布局与逻辑
+# ==========================================
 
 # 加载数据
-with st.spinner('正在从美联储和华尔街拉取最新数据...'):
-    market_df = get_market_data(period=f"{days_map[time_range]//365}y")
-    liq_df = get_fed_liquidity_data(start_date_str)
-    rates_df = get_rates_stress(start_date_str)
+df = get_data_bundle(start_date_str)
 
-# 对齐数据索引 (因为FRED和股市日期可能不完全重合)
-combined_df = market_df.join(liq_df, how='inner').join(rates_df, how='inner')
+if not df.empty:
+    latest = df.iloc[-1]
+    # 尝试获取前一个交易日数据用于计算变动，防止数据太少报错
+    if len(df) > 1:
+        prev = df.iloc[-2]
+    else:
+        prev = latest
 
-# --- 核心指标概览 ---
-col1, col2, col3, col4 = st.columns(4)
-if not combined_df.empty:
-    latest = combined_df.iloc[-1]
-    prev = combined_df.iloc[-2]
+    # --- 顶栏：关键指标 KPI ---
+    st.markdown("### 📊 市场核心看板")
+    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
     
-    col1.metric("标普500 (SPY)", f"${latest['SPY']:.2f}", f"{(latest['SPY']/prev['SPY']-1)*100:.2f}%")
-    col2.metric("净流动性 (Net Liquidity)", f"${latest['Net_Liquidity']:.2f} B", f"{(latest['Net_Liquidity'] - prev['Net_Liquidity']):.2f} B")
-    col3.metric("10年美债收益率", f"{latest['^TNX']:.2f}%", f"{(latest['^TNX'] - prev['^TNX']):.2f}")
-    col4.metric("SOFR - EFFR 利差", f"{latest['Spread']:.2f}", "流动性压力指标")
-
-# --- 标签页视图 ---
-tab1, tab2, tab3 = st.tabs(["💧 净流动性模型", "⚖️ 股权风险溢价 (ERP)", "🚨 利率压力监测"])
-
-# === 模型 1: 净流动性 vs 标普500 ===
-with tab1:
-    st.subheader("美联储净流动性 vs 标普500")
-    st.markdown(r"公式: $\text{Net Liquidity} = \text{Fed Balance Sheet} - \text{TGA} - \text{RRP}$")
+    kpi1.metric(
+        "标普500 (SPY)", 
+        f"${latest['SPY']:.2f}", 
+        f"{(latest['SPY']/prev['SPY']-1)*100:.2f}%",
+        delta_color="normal"
+    )
+    kpi2.metric(
+        "美联储净流动性", 
+        f"${latest['Net_Liquidity']:.2f} B", 
+        f"{(latest['Net_Liquidity'] - prev['Net_Liquidity']):.2f} B",
+        help="Fed资产负债表 - TGA - RRP"
+    )
+    kpi3.metric(
+        "10年美债收益率", 
+        f"{latest['10Y_Yield']:.2f}%", 
+        f"{(latest['10Y_Yield'] - prev['10Y_Yield']):.2f}",
+        delta_color="inverse" # 收益率涨通常是坏事，显示红色
+    )
     
-    fig1 = make_subplots(specs=[[{"secondary_y": True}]])
+    # 智能判断 SOFR 状态
+    spread_val = latest['Rate_Spread']
+    spread_color = "normal" if spread_val < 0.05 else "inverse" # 利差过大显示红色警告
+    kpi4.metric(
+        "资金压力 (SOFR-EFFR)", 
+        f"{spread_val:.3f}%", 
+        "正常" if spread_val < 0.05 else "⚠️ 紧张",
+        delta_color="off"
+    )
+
+    st.markdown("---")
+
+    # --- 第一行：核心主图 (流动性 vs 股市) ---
+    # PC端这幅图最重要，给予整行宽度
     
-    # 绘制净流动性
-    fig1.add_trace(
-        go.Scatter(x=combined_df.index, y=combined_df['Net_Liquidity'], name="净流动性 (十亿)", line=dict(color='cyan', width=2)),
+    st.subheader("💧 宏观流动性驱动模型")
+    
+    fig_liq = make_subplots(specs=[[{"secondary_y": True}]])
+    
+    # 区域图显示流动性
+    fig_liq.add_trace(
+        go.Scatter(
+            x=df.index, y=df['Net_Liquidity'], 
+            name="净流动性 (Net Liquidity)", 
+            fill='tozeroy', # 填充背景，视觉更强
+            line=dict(color='rgba(0, 255, 255, 0.5)', width=1),
+            fillcolor='rgba(0, 255, 255, 0.1)'
+        ),
         secondary_y=False
     )
     
-    # 绘制标普500
-    fig1.add_trace(
-        go.Scatter(x=combined_df.index, y=combined_df['SPY'], name="标普500 (SPY)", line=dict(color='orange', width=2)),
+    # 线条显示标普
+    fig_liq.add_trace(
+        go.Scatter(x=df.index, y=df['SPY'], name="标普500 (SPY)", line=dict(color='#ff9f1c', width=2)),
         secondary_y=True
     )
     
-    fig1.update_layout(title_text="流动性水位 vs 股市走势", hovermode="x unified", height=500)
-    fig1.update_yaxes(title_text="净流动性 (Billion USD)", secondary_y=False)
-    fig1.update_yaxes(title_text="SPY 股价", secondary_y=True)
-    st.plotly_chart(fig1, use_container_width=True)
-    
-    st.info("💡 **解读**：当青色线（流动性）大幅下降时，橙色线（股市）通常面临巨大的回调压力。关注TGA账户激增带来的抽水效应。")
-
-# === 模型 2: 股权风险溢价 (ERP) ===
-with tab2:
-    st.subheader("简易股权风险溢价 (ERP) 模型")
-    st.markdown(r"逻辑: 比较 $\frac{1}{PE} \text{ (盈利收益率)}$ 与 $10\text{Y Yield}$")
-    
-    # 计算简易 ERP: (1 / PE_Ratio) - 10Y_Yield
-    # 注意: 这里的PE用静态数据模拟，实际生产环境最好接财报数据API。
-    # 这里我们用 SPY的价格倒数作为估值的简单反向代理，或者直接用 Earning Yield (假设PE=25左右作为基准波动)
-    # 为了演示，我们简单计算：SPY Earning Yield 估算 = 4% (假设) - 10Y Yield
-    
-    # 更精确的做法是用 SPY的 EPS 数据。这里我们用 10年美债收益率 vs 纳指走势做负相关对比。
-    fig2 = make_subplots(specs=[[{"secondary_y": True}]])
-    
-    fig2.add_trace(
-        go.Scatter(x=combined_df.index, y=combined_df['^TNX'], name="10年美债收益率", line=dict(color='red', width=2)),
-        secondary_y=False
+    fig_liq.update_layout(
+        height=450, 
+        margin=dict(l=20, r=20, t=30, b=20),
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     )
+    fig_liq.update_yaxes(title_text="净流动性 (十亿 $)", secondary_y=False, showgrid=False)
+    fig_liq.update_yaxes(title_text="标普500点位", secondary_y=True, showgrid=True, gridcolor='rgba(128,128,128,0.2)')
     
-    fig2.add_trace(
-        go.Scatter(x=combined_df.index, y=combined_df['QQQ'], name="纳斯达克100 (QQQ)", line=dict(color='green', width=2)),
-        secondary_y=True
-    )
-    
-    # 翻转左侧坐标轴 (收益率越高，越利空)
-    fig2.update_yaxes(autorange="reversed", title_text="10年收益率 (逆序)", secondary_y=False)
-    fig2.update_yaxes(title_text="QQQ 股价", secondary_y=True)
-    
-    st.plotly_chart(fig2, use_container_width=True)
-    st.warning("⚠️ **注意**：图中红色线（收益率）是**倒序**排列的。如果红线向下插（收益率飙升），绿线（纳指）通常会跟随下跌。")
+    st.plotly_chart(fig_liq, use_container_width=True)
 
-# === 模型 3: 资金市场压力 (SOFR) ===
-with tab3:
-    st.subheader("回购市场压力计 (SOFR vs EFFR)")
-    
-    fig3 = go.Figure()
-    fig3.add_trace(go.Scatter(x=combined_df.index, y=combined_df['SOFR'], name='SOFR (担保隔夜利率)'))
-    fig3.add_trace(go.Scatter(x=combined_df.index, y=combined_df['EFFR'], name='EFFR (联邦基金利率)', line=dict(dash='dash')))
-    
-    fig3.update_layout(title="银行间资金成本监控", height=500)
-    st.plotly_chart(fig3, use_container_width=True)
-    
-    st.markdown("""
-    **监控逻辑：**
-    * 正常情况下，**SOFR** 应该紧贴 **EFFR**。
-    * 如果 **SOFR 突然大幅高于 EFFR**（例如本周发债期间），说明市场**缺钱**（抵押品太多，钱太少）。
-    * 这通常是股市暴跌的前兆信号。
-    """)
+    # --- 第二行：左右分栏 (ERP估值 和 资金压力) ---
+    col_left, col_right = st.columns(2)
 
-# 底部数据展示
-with st.expander("查看原始数据"):
-    st.dataframe(combined_df.sort_index(ascending=False))
+    with col_left:
+        st.subheader("📉 纳指 vs 利率 (倒序)")
+        st.caption("红线向下代表收益率飙升，通常压制纳指")
+        
+        fig_erp = make_subplots(specs=[[{"secondary_y": True}]])
+        
+        # 10年期美债 (倒序)
+        fig_erp.add_trace(
+            go.Scatter(x=df.index, y=df['10Y_Yield'], name="10年美债 (倒序)", line=dict(color='#ff595e', width=2)),
+            secondary_y=False
+        )
+        
+        # 纳指
+        fig_erp.add_trace(
+            go.Scatter(x=df.index, y=df['QQQ'], name="纳指100 (QQQ)", line=dict(color='#8ac926', width=2)),
+            secondary_y=True
+        )
+        
+        # 关键：翻转左侧坐标轴
+        fig_erp.update_yaxes(autorange="reversed", title_text="收益率 %", secondary_y=False, showgrid=False)
+        fig_erp.update_yaxes(title_text="QQQ 股价", secondary_y=True)
+        fig_erp.update_layout(height=400, hovermode="x unified", margin=dict(l=10, r=10, t=30, b=20))
+        
+        st.plotly_chart(fig_erp, use_container_width=True)
+
+    with col_right:
+        st.subheader("🚨 资金市场压力 (SOFR)")
+        st.caption("蓝线若大幅偏离虚线，提示流动性枯竭风险")
+        
+        fig_sofr = go.Figure()
+        
+        fig_sofr.add_trace(go.Scatter(x=df.index, y=df['SOFR'], name='SOFR', line=dict(color='#1982c4', width=2)))
+        fig_sofr.add_trace(go.Scatter(x=df.index, y=df['EFFR'], name='EFFR (基准)', line=dict(color='gray', dash='dash')))
+        
+        fig_sofr.update_layout(height=400, hovermode="x unified", margin=dict(l=10, r=10, t=30, b=20))
+        fig_sofr.update_yaxes(title_text="利率 %")
+        
+        st.plotly_chart(fig_sofr, use_container_width=True)
+
+    # --- 底部数据源说明 ---
+    st.caption(f"数据来源: Federal Reserve (FRED) & Yahoo Finance | 更新时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+
+else:
+    st.warning("暂无数据，请检查网络连接或 API Key 设置。")
